@@ -8,13 +8,16 @@ import org.bukkit.Location;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.Server;
 import org.bukkit.World;
+import org.bukkit.block.Block;
 import org.bukkit.block.Sign;
 import org.bukkit.block.Skull;
+import org.bukkit.block.data.BlockData;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Villager;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.MerchantRecipe;
+import org.bukkit.plugin.Plugin;
 
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.ConfigHandler;
@@ -33,6 +36,8 @@ public class PaperAdapter implements PaperInterface {
     public static final int PAPER_V1_20 = BukkitAdapter.BUKKIT_V1_20;
     public static final int PAPER_V1_21 = BukkitAdapter.BUKKIT_V1_21;
     public static final int PAPER_V26_0 = BukkitAdapter.BUKKIT_V26_0;
+    public static final int PAPER_V26_1 = BukkitAdapter.BUKKIT_V26_1;
+    public static final int PAPER_V26_2 = BukkitAdapter.BUKKIT_V26_2;
 
     public static void loadAdapter() {
         int paperVersion = ConfigHandler.SERVER_VERSION;
@@ -52,8 +57,10 @@ public class PaperAdapter implements PaperInterface {
                 break;
             case PAPER_V1_17:
             case PAPER_V1_18:
-            case PAPER_V1_19:
                 PaperAdapter.ADAPTER = new Paper_v1_17();
+                break;
+            case PAPER_V1_19:
+                PaperAdapter.ADAPTER = new Paper_v1_19();
                 break;
             case PAPER_V1_20:
                 PaperAdapter.ADAPTER = new Paper_v1_20();
@@ -62,8 +69,14 @@ public class PaperAdapter implements PaperInterface {
                 PaperAdapter.ADAPTER = new Paper_v1_20();
                 break;
             case PAPER_V26_0:
-            default:
+            case PAPER_V26_1:
                 PaperAdapter.ADAPTER = new Paper_26_0();
+                break;
+            case PAPER_V26_2:
+                PaperAdapter.ADAPTER = new Paper_v26_2();
+                break;
+            default:
+                PaperAdapter.ADAPTER = paperVersion >= PAPER_V26_2 ? new Paper_v26_2() : new Paper_26_0();
                 break;
         }
     }
@@ -89,6 +102,11 @@ public class PaperAdapter implements PaperInterface {
     }
 
     @Override
+    public boolean isAttached(Block block, Block scanBlock, BlockData blockData, int scanMin) {
+        return true;
+    }
+
+    @Override
     public void teleportAsync(Entity entity, Location location) {
         entity.teleport(location);
     }
@@ -96,6 +114,26 @@ public class PaperAdapter implements PaperInterface {
     @Override
     public void prefetchChunk(World world, int chunkX, int chunkZ) {
         // chunk prefetching requires the Paper async chunk API
+    }
+
+    @Override
+    public boolean isOwnedByCurrentRegion(Entity entity) {
+        return true;
+    }
+
+    @Override
+    public boolean isOwnedByCurrentRegion(World world, int chunkX, int chunkZ) {
+        return true;
+    }
+
+    @Override
+    public boolean executeEntityTask(Plugin plugin, Entity entity, Runnable task, Runnable retiredTask) {
+        return false;
+    }
+
+    @Override
+    public boolean executeEntityTask(Plugin plugin, Entity entity, Runnable task, Runnable retiredTask, long delayTicks) {
+        return false;
     }
 
     @Override
