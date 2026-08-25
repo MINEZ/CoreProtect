@@ -8,13 +8,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Map.Entry;
 import java.util.Set;
 import java.util.UUID;
 
 import org.bukkit.Location;
 import org.bukkit.Material;
 
+import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Consumer;
 import net.coreprotect.consumer.Queue;
@@ -80,6 +80,13 @@ public class Process {
 
     public static int getCurrentConsumerSize() {
         return currentConsumerSize;
+    }
+
+    protected static int consumerDelay(boolean backlog) {
+        if (backlog || !ConfigHandler.databaseType.isClickHouse()) {
+            return 500;
+        }
+        return Math.max(500, Config.getGlobal().CLICKHOUSE_CONSUMER_DELAY);
     }
 
     public static boolean isRollbackPublication(int action, Object object) {
@@ -208,17 +215,7 @@ public class Process {
                 }
             }
 
-            // Scan through usernames, ensure everything is loaded in memory.
-            for (Entry<Integer, String[]> entry : users.entrySet()) {
-                String[] data = entry.getValue();
-                if (data != null) {
-                    String user = data[0];
-                    String uuid = data[1];
-                    if (user != null && ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT)) == null) {
-                        writeBatch.resolveUserId(user, uuid);
-                    }
-                }
-            }
+            preflightUsers(writeBatch, consumerData, users);
             updateLockTable(writeBatch, (lastRun ? 0 : 1));
             if (!commit(writeBatch)) {
                 invalidateUserCaches(users);
@@ -472,9 +469,10 @@ public class Process {
                                     break;
                             }
 
-                            // If interrupt requested, commit data, sleep, and resume processing
+                            // Commit full or interrupted batches before continuing.
                             boolean interrupted = Consumer.interrupt;
-                            if ((interrupted || writeBatch.shouldCommit()) && !isolatedTransaction) {
+                            boolean batchLimitReached = writeBatch.shouldCommit();
+                            if ((interrupted || batchLimitReached) && !isolatedTransaction) {
                                 boolean committed = commit(writeBatch);
                                 if (committed) {
                                     processedThrough = i + 1;
@@ -484,9 +482,10 @@ public class Process {
                                     failConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, i + 1);
                                     return;
                                 }
-                                if (interrupted) {
+                                boolean backlog = batchLimitReached && ConfigHandler.databaseType.isClickHouse() && i + 1 < consumerDataSize;
+                                if (interrupted || backlog) {
                                     try {
-                                        Thread.sleep(500);
+                                        Thread.sleep(consumerDelay(true));
                                     }
                                     catch (InterruptedException exception) {
                                         Thread.currentThread().interrupt();
@@ -775,6 +774,25 @@ public class Process {
         catch (Exception e) {
             ErrorReporter.report(e);
             return false;
+        }
+    }
+
+    static void preflightUsers(ConsumerWriteBatch batch, List<Object[]> consumerData,
+            Map<Integer, String[]> users) throws Exception {
+        for (Object[] data : consumerData) {
+            if (data == null) {
+                continue;
+            }
+            String[] userData = users.get((int) data[0]);
+            if (userData == null) {
+                continue;
+            }
+            String user = userData[0];
+            String uuid = userData[1];
+            if (user != null && ((ConfigHandler.databaseType.isClickHouse() && uuid != null && !uuid.isEmpty())
+                    || ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT)) == null)) {
+                batch.resolveUserId(user, uuid);
+            }
         }
     }
 
