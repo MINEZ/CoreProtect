@@ -22,6 +22,7 @@ import net.coreprotect.command.lookup.EntityInteractionLookupThread;
 import net.coreprotect.command.lookup.StandardLookupThread;
 import net.coreprotect.command.parser.ActionParser;
 import net.coreprotect.command.parser.MessageFilterParser;
+import net.coreprotect.command.parser.MetadataFilterParser;
 import net.coreprotect.command.parser.RollbackStateParser;
 import net.coreprotect.config.Config;
 import net.coreprotect.config.ConfigHandler;
@@ -43,6 +44,9 @@ public class LookupCommand {
         MessageFilterParser.ParseResult messageFilterResult = CommandParser.parseMessageFilters(args);
         args = messageFilterResult.getArguments();
         List<String> argFilters = messageFilterResult.getFilters();
+        MetadataFilterParser.ParseResult metadataFilterResult = CommandParser.parseMetadataFilters(args);
+        args = metadataFilterResult.getArguments();
+        List<String> argMetadataFilters = metadataFilterResult.getFilters();
         args = CommandParser.parsePage(args);
         Location lo = CommandParser.parseLocation(player, args);
         // List<String> arg_uuids = new ArrayList<String>();
@@ -207,6 +211,22 @@ public class LookupCommand {
             boolean signLookup = !argAction.isEmpty() && argAction.stream().allMatch(action -> action == LookupActions.SIGN);
             if (!messageLookup && !signLookup) {
                 Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INCOMPATIBLE_ACTION, "f:<filter>"));
+                return;
+            }
+        }
+        if (metadataFilterResult.isSpecified()) {
+            if (metadataFilterResult.hasInvalidLength()) {
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INVALID_PARAMETER, "m:<metadata>"));
+                return;
+            }
+            /* 没有元数据列的动作一律拒绝，避免筛选被静默忽略 */
+            if (argAction.contains(LookupActions.CHAT) || argAction.contains(LookupActions.COMMAND) || argAction.contains(LookupActions.SESSION) || argAction.contains(LookupActions.USERNAME) || argAction.contains(LookupActions.SIGN)) {
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INCOMPATIBLE_ACTION, "m:<metadata>"));
+                return;
+            }
+            /* 汇总模式走的是另一条查询链，尚未接入元数据筛选 */
+            if (outputMode == LookupOutputMode.SUMMARY) {
+                Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Phrase.build(Phrase.INCOMPATIBLE_ACTION, "m:<metadata>"));
                 return;
             }
         }
@@ -571,6 +591,7 @@ public class LookupCommand {
                     argAction = ConfigHandler.lookupAlist.get(player.getName());
                     argEntityActionFilter = ConfigHandler.lookupEntityActionFilter.getOrDefault(player.getName(), EntityActionFilter.DEFAULT);
                     argFilters = ConfigHandler.lookupFlist.getOrDefault(player.getName(), Collections.emptyList());
+                    argMetadataFilters = ConfigHandler.lookupMlist.getOrDefault(player.getName(), Collections.emptyList());
                     argRadius = ConfigHandler.lookupRadius.get(player.getName());
                     ts = ConfigHandler.lookupTime.get(player.getName());
                     outputMode = ConfigHandler.lookupOutputMode.getOrDefault(player.getName(), LookupOutputMode.DETAIL);
@@ -651,7 +672,7 @@ public class LookupCommand {
 
                     Chat.sendMessage(player, Color.DARK_AQUA + "CoreProtect " + Color.WHITE + "- " + Color.ITALIC + Phrase.build(Phrase.LOOKUP_SEARCHING));
 
-                    Runnable runnable = new StandardLookupThread(player, command, rollbackusers, argBlocks, argExclude, argExcludeUsers, argAction, argEntityActionFilter, argFilters, argRadius, lo, x, y, z, wid, argWid, timeStart, timeEnd, argNoisy, argExcluded, argRestricted, pa, re, type, ts, outputMode, rollbackState);
+                    Runnable runnable = new StandardLookupThread(player, command, rollbackusers, argBlocks, argExclude, argExcludeUsers, argAction, argEntityActionFilter, argFilters, argMetadataFilters, argRadius, lo, x, y, z, wid, argWid, timeStart, timeEnd, argNoisy, argExcluded, argRestricted, pa, re, type, ts, outputMode, rollbackState);
                     Thread thread = new Thread(runnable);
                     thread.start();
                 }

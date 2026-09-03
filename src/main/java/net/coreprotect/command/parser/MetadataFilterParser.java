@@ -4,54 +4,22 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 
-public final class MessageFilterParser {
+/**
+ * 解析 m:/meta:/metadata: 参数。
+ *
+ * 该参数用于按物品元数据内容筛选查询结果，典型用途是筛出带有特定命名空间 ID 的
+ * 附魔、标签或自定义数据的物品，例如 m:minez:eternal_covenant。
+ *
+ * 匹配语义为“序列化后的元数据字节中包含该 token”。之所以可行，是因为 Bukkit 在
+ * 序列化 ItemMeta 时会把附魔键、PDC 键等以字面 UTF-8 字符串写入字节流。
+ */
+public final class MetadataFilterParser {
     public static final int MINIMUM_FILTER_CODE_POINTS = 3;
 
-    private static final List<String> VALUE_KEYS = List.of(
-            "a:",
-            "action:",
-            "b:",
-            "block:",
-            "blocks:",
-            "c:",
-            "coord:",
-            "coords:",
-            "cord:",
-            "cords:",
-            "coordinate:",
-            "coordinates:",
-            "cordinate:",
-            "cordinates:",
-            "e:",
-            "exclude:",
-            "f:",
-            "filter:",
-            "i:",
-            "include:",
-            "item:",
-            "items:",
-            "location:",
-            "m:",
-            "meta:",
-            "metadata:",
-            "p:",
-            "page:",
-            "position:",
-            "r:",
-            "radius:",
-            "rows:",
-            "t:",
-            "time:",
-            "u:",
-            "user:",
-            "users:"
-    );
-
-    private MessageFilterParser() {
+    private MetadataFilterParser() {
         throw new IllegalStateException("Parser class");
     }
 
@@ -66,14 +34,14 @@ public final class MessageFilterParser {
 
         for (int index = 0; index < inputArguments.length; index++) {
             String argument = Objects.toString(inputArguments[index], "").trim();
-            if (!isFilterParameter(argument)) {
+            if (!isMetadataParameter(argument)) {
                 arguments.add(argument);
                 continue;
             }
 
             specified = true;
             StringBuilder collected = new StringBuilder(argument);
-            while (index + 1 < inputArguments.length && !isLookupTerminator(inputArguments[index + 1])) {
+            while (index + 1 < inputArguments.length && !MessageFilterParser.isLookupTerminator(inputArguments[index + 1])) {
                 String next = Objects.toString(inputArguments[++index], "").trim();
                 if (!next.isEmpty()) {
                     collected.append(' ').append(next);
@@ -88,34 +56,9 @@ public final class MessageFilterParser {
         return new ParseResult(arguments.toArray(new String[0]), new ArrayList<>(filters), specified);
     }
 
-    public static boolean isLookupTerminator(String raw) {
-        String normalized = normalize(raw);
-        if (isControl(normalized)) {
-            return true;
-        }
-        for (String key : VALUE_KEYS) {
-            if (normalized.startsWith(key)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean isFilterParameter(String raw) {
-        String normalized = normalize(raw);
-        return normalized.equals("f:") || normalized.startsWith("f:") || normalized.equals("filter:") || normalized.startsWith("filter:");
-    }
-
-    private static boolean isControl(String normalized) {
-        return normalized.equals("#count") || normalized.equals("#sum") || normalized.equals("count") || normalized.equals("sum") || normalized.equals("#summary")
-                || normalized.equals("n") || normalized.equals("noisy") || normalized.equals("v") || normalized.equals("verbose")
-                || normalized.equals("#v") || normalized.equals("#verbose") || normalized.equals("#silent")
-                || normalized.equals("#container") || normalized.equals("#preview") || normalized.equals("#preview_cancel") || normalized.equals("#preview-cancel")
-                || RollbackStateParser.isModifier(normalized);
-    }
-
-    private static String normalize(String raw) {
-        return Objects.toString(raw, "").trim().toLowerCase(Locale.ROOT).replace("\\", "").replace("'", "");
+    public static boolean isMetadataParameter(String raw) {
+        String normalized = Objects.toString(raw, "").trim().toLowerCase(java.util.Locale.ROOT).replace("\\", "").replace("'", "");
+        return normalized.startsWith("m:") || normalized.startsWith("meta:") || normalized.startsWith("metadata:");
     }
 
     private static String value(String argument) {

@@ -71,6 +71,7 @@ public class StandardLookupThread implements Runnable {
     private final List<Integer> actions;
     private final EntityActionFilter entityActionFilter;
     private final List<String> messageFilters;
+    private final List<String> metadataFilters;
     private final Integer[] radius;
     private final Location location;
     private final int x;
@@ -90,7 +91,7 @@ public class StandardLookupThread implements Runnable {
     private final LookupOutputMode outputMode;
     private final LookupRollbackState rollbackState;
 
-    public StandardLookupThread(CommandSender player, Command command, List<String> rollbackUsers, List<Object> blockList, Map<Object, Boolean> excludedBlocks, List<String> excludedUsers, List<Integer> actions, EntityActionFilter entityActionFilter, List<String> messageFilters, Integer[] radius, Location location, int x, int y, int z, int worldId, int argWorldId, long timeStart, long timeEnd, int noisy, int excluded, int restricted, int page, int displayResults, int typeLookup, String rtime, LookupOutputMode outputMode, LookupRollbackState rollbackState) {
+    public StandardLookupThread(CommandSender player, Command command, List<String> rollbackUsers, List<Object> blockList, Map<Object, Boolean> excludedBlocks, List<String> excludedUsers, List<Integer> actions, EntityActionFilter entityActionFilter, List<String> messageFilters, List<String> metadataFilters, Integer[] radius, Location location, int x, int y, int z, int worldId, int argWorldId, long timeStart, long timeEnd, int noisy, int excluded, int restricted, int page, int displayResults, int typeLookup, String rtime, LookupOutputMode outputMode, LookupRollbackState rollbackState) {
         this.player = player;
         this.command = command;
         this.rollbackUsers = rollbackUsers;
@@ -100,6 +101,7 @@ public class StandardLookupThread implements Runnable {
         this.actions = actions;
         this.entityActionFilter = entityActionFilter;
         this.messageFilters = messageFilters;
+        this.metadataFilters = metadataFilters;
         this.radius = radius;
         this.location = location;
         this.x = x;
@@ -151,6 +153,7 @@ public class StandardLookupThread implements Runnable {
             ConfigHandler.lookupAlist.put(player.getName(), actions);
             ConfigHandler.lookupEntityActionFilter.put(player.getName(), entityActionFilter);
             ConfigHandler.lookupFlist.put(player.getName(), messageFilters);
+            ConfigHandler.lookupMlist.put(player.getName(), metadataFilters);
             ConfigHandler.lookupRadius.put(player.getName(), radius);
             ConfigHandler.lookupOutputMode.put(player.getName(), outputMode == LookupOutputMode.COUNT ? LookupOutputMode.DETAIL : outputMode);
             ConfigHandler.lookupRollbackState.put(player.getName(), rollbackState);
@@ -268,7 +271,7 @@ public class StandardLookupThread implements Runnable {
                                 rows = Lookup.countSummaryRows(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, entityContext, finalLocation, radius, timeStart, timeEnd, restrict_world, entityContainerId, rollbackState);
                             }
                             if (rows > 0 && !summaryRecordCountKnown) {
-                                recordRows = Lookup.countLookupRows(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, restrict_world, true, entityContainerId, rollbackState);
+                                recordRows = Lookup.countLookupRows(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, metadataFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, restrict_world, true, entityContainerId, rollbackState);
                             }
                             if (rows > 0) {
                                 rowData[0] = recordRows;
@@ -279,11 +282,11 @@ public class StandardLookupThread implements Runnable {
                         }
                         else {
                             if (pageStart == 0 && outputMode == LookupOutputMode.DETAIL && ConfigHandler.databaseType.isDuckDB()) {
-                                lookupPage = Lookup.performDuckDBLookupPage(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, displayResults, restrict_world, true, entityContainerId, rollbackState);
+                                lookupPage = Lookup.performDuckDBLookupPage(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, metadataFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, displayResults, restrict_world, true, entityContainerId, rollbackState);
                                 rows = lookupPage.getTotalRows();
                             }
                             else {
-                                rows = Lookup.countLookupRows(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, restrict_world, true, entityContainerId, rollbackState);
+                                rows = Lookup.countLookupRows(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, metadataFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, restrict_world, true, entityContainerId, rollbackState);
                             }
                         }
                         rowData[4] = rows;
@@ -294,7 +297,7 @@ public class StandardLookupThread implements Runnable {
                         if (cursor == null || cursor.getNextPage() != page || cursor.getPageSize() != displayResults) {
                             cursor = null;
                         }
-                        lookupPage = Lookup.performDuckDBLookupPage(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, (int) pageStart, displayResults, rows, cursor, restrict_world, true, entityContainerId, rollbackState);
+                        lookupPage = Lookup.performDuckDBLookupPage(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, metadataFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, (int) pageStart, displayResults, rows, cursor, restrict_world, true, entityContainerId, rollbackState);
                     }
                     if (lookupPage != null) {
                         LookupCursor nextCursor = lookupPage.getNextCursor();
@@ -317,7 +320,7 @@ public class StandardLookupThread implements Runnable {
                     }
                     else if (pageStart < rows) {
                         List<String[]> lookupList = lookupPage == null
-                                ? Lookup.performPartialLookup(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, (int) pageStart, displayResults, restrict_world, true, entityContainerId, rollbackState)
+                                ? Lookup.performPartialLookup(statement, player, uuidList, userList, blockList, excludedBlocks, excludedUsers, actions, entityActionFilter, messageFilters, metadataFilters, entityContext, finalLocation, radius, rowData, timeStart, timeEnd, (int) pageStart, displayResults, restrict_world, true, entityContainerId, rollbackState)
                                 : lookupPage.getRows();
 
                         Map<Integer, EntitySpawnRecord> entitySpawnRecords = Collections.emptyMap();
