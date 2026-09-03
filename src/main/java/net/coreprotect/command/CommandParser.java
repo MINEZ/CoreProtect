@@ -285,6 +285,10 @@ public class CommandParser {
         return MaterialParser.getTags();
     }
 
+    protected static Set<String> getDynamicTagKeys() {
+        return MaterialParser.getDynamicTagKeys();
+    }
+
     /**
      * Check if an argument matches a block tag
      * 

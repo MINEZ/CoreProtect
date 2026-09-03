@@ -71,6 +71,7 @@ import net.coreprotect.paper.listener.CopperGolemChestListener;
 import net.coreprotect.paper.listener.FlowerPotManipulateListener;
 import net.coreprotect.paper.listener.LegacyTNTPrimeListener;
 import net.coreprotect.paper.listener.PaperChatListener;
+import net.coreprotect.paper.listener.ServerResourcesReloadedListener;
 
 public final class ListenerHandler {
 
@@ -79,6 +80,14 @@ public final class ListenerHandler {
         PluginManager pluginManager = plugin.getServer().getPluginManager();
 
         // Paper Listeners / Fallbacks (Block Listeners)
+        try {
+            Class.forName("io.papermc.paper.event.server.ServerResourcesReloadedEvent"); // Paper 1.16+
+            pluginManager.registerEvents(new ServerResourcesReloadedListener(), plugin);
+        }
+        catch (Exception e) {
+            /* 非 Paper 环境下标签缓存仅在启动时构建 */
+        }
+
         try {
             Class.forName("io.papermc.paper.event.block.BlockPreDispenseEvent"); // Paper 1.16+
             pluginManager.registerEvents(new BlockPreDispenseListener(), plugin);

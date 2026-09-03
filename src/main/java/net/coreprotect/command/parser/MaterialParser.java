@@ -1,14 +1,20 @@
 package net.coreprotect.command.parser;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
+import org.bukkit.Bukkit;
+import org.bukkit.Keyed;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
+import org.bukkit.Tag;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.EntityType;
 
@@ -222,6 +228,144 @@ public class MaterialParser {
      * 
      * @return A map of block tags and their associated materials
      */
+    /**
+     * 原版与数据包标签的缓存。键为 "#命名空间:路径"，值为标签展开后的 Material 或 EntityType。
+     *
+     * 之所以不写死材质清单，是因为硬编码的 BlockGroup 会随版本更新而过时——例如 DOORS
+     * 至今仍只有 8 种门，缺了 mangrove、cherry、bamboo 等。改为运行时读取注册表后，
+     * 服务端支持什么标签就有什么标签，无需跟随 Minecraft 版本维护。
+     */
+    private static volatile Map<String, Set<Object>> dynamicTagCache;
+
+    /**
+     * 使标签缓存失效，下次访问时重建。数据包加载或重载后应调用。
+     */
+    public static void invalidateDynamicTags() {
+        dynamicTagCache = null;
+    }
+
+    /**
+     * 获取全部动态标签，按需构建缓存。
+     */
+    private static Map<String, Set<Object>> getDynamicTags() {
+        Map<String, Set<Object>> cache = dynamicTagCache;
+        if (cache != null) {
+            return cache;
+        }
+
+        Map<String, Set<Object>> built = new HashMap<>();
+        collectTags(built, Tag.REGISTRY_BLOCKS, Material.class);
+        collectTags(built, Tag.REGISTRY_ITEMS, Material.class);
+        collectTags(built, Tag.REGISTRY_ENTITY_TYPES, EntityType.class);
+
+        cache = Collections.unmodifiableMap(built);
+        dynamicTagCache = cache;
+        return cache;
+    }
+
+    private static <T extends Keyed> void collectTags(Map<String, Set<Object>> target, String registry, Class<T> clazz) {
+        try {
+            for (Tag<T> tag : Bukkit.getTags(registry, clazz)) {
+                mergeTag(target, tag);
+            }
+        }
+        catch (Throwable e) {
+            /* 服务端未提供该注册表时跳过，其余注册表照常可用 */
+        }
+    }
+
+    private static <T extends Keyed> void mergeTag(Map<String, Set<Object>> target, Tag<T> tag) {
+        if (tag == null) {
+            return;
+        }
+
+        NamespacedKey key = tag.getKey();
+        Set<T> values = tag.getValues();
+        if (key == null || values == null || values.isEmpty()) {
+            return;
+        }
+
+        /* blocks 与 items 下的同名标签取并集 */
+        target.computeIfAbsent("#" + key.getNamespace() + ":" + key.getKey(), unused -> new HashSet<>()).addAll(values);
+    }
+
+    /**
+     * 供 Tab 补全使用的全部动态标签键。
+     */
+    public static Set<String> getDynamicTagKeys() {
+        return getDynamicTags().keySet();
+    }
+
+    /**
+     * 将 #标签 解析为对应的 Material / EntityType 集合，无法解析时返回 null。
+     *
+     * 省略命名空间时优先匹配 minecraft，其次要求在其他命名空间下唯一；
+     * 命中多个则返回 null，要求使用者写全命名空间以消除歧义。
+     */
+    public static Set<Object> resolveDynamicTag(String argument) {
+        if (argument == null || argument.length() < 2 || argument.charAt(0) != '#') {
+            return null;
+        }
+
+        Map<String, Set<Object>> tags = getDynamicTags();
+        String name = argument.substring(1).toLowerCase(Locale.ROOT);
+
+        if (name.indexOf(':') >= 0) {
+            Set<Object> values = tags.get("#" + name);
+            return values != null ? values : lookupTagDirectly(name);
+        }
+
+        Set<Object> vanilla = tags.get("#" + NamespacedKey.MINECRAFT + ":" + name);
+        if (vanilla != null) {
+            return vanilla;
+        }
+
+        Set<Object> matched = null;
+        String suffix = ":" + name;
+        for (Entry<String, Set<Object>> entry : tags.entrySet()) {
+            if (entry.getKey().endsWith(suffix)) {
+                if (matched != null) {
+                    return null;
+                }
+
+                matched = entry.getValue();
+            }
+        }
+
+        return matched;
+    }
+
+    /**
+     * 按完整键直接向服务端查询标签。
+     *
+     * 用于兜底：即便某些服务端实现在枚举时不返回数据包标签，
+     * 只要使用者写全了命名空间，这里仍然能解析出来。
+     */
+    private static Set<Object> lookupTagDirectly(String name) {
+        NamespacedKey key = NamespacedKey.fromString(name);
+        if (key == null) {
+            return null;
+        }
+
+        Set<Object> values = new HashSet<>();
+        appendTagValues(values, Tag.REGISTRY_BLOCKS, key, Material.class);
+        appendTagValues(values, Tag.REGISTRY_ITEMS, key, Material.class);
+        appendTagValues(values, Tag.REGISTRY_ENTITY_TYPES, key, EntityType.class);
+        return values.isEmpty() ? null : values;
+    }
+
+    private static <T extends Keyed> void appendTagValues(Set<Object> target, String registry, NamespacedKey key, Class<T> clazz) {
+        try {
+            Tag<T> tag = Bukkit.getTag(registry, key, clazz);
+            if (tag != null && tag.getValues() != null) {
+                target.addAll(tag.getValues());
+            }
+        }
+        catch (Throwable e) {
+            /* 该注册表下无此标签 */
+        }
+    }
+
     public static Map<String, Set<Material>> getTags() {
         Map<String, Set<Material>> tagMap = new HashMap<>();
         tagMap.put("#button", BlockGroup.BUTTONS);
@@ -244,7 +388,7 @@ public class MaterialParser {
      * @return true if the argument matches a block tag
      */
     public static boolean checkTags(String argument) {
-        return getTags().containsKey(argument);
+        return getTags().containsKey(argument) || resolveDynamicTag(argument) != null;
     }
 
     /**
@@ -270,6 +414,15 @@ public class MaterialParser {
             }
         }
 
+        Set<Object> tagValues = resolveDynamicTag(argument);
+        if (tagValues != null) {
+            for (Object tagValue : tagValues) {
+                list.put(tagValue, false);
+            }
+
+            return true;
+        }
+
         return false;
     }
 
@@ -291,6 +444,12 @@ public class MaterialParser {
                 list.addAll(materials);
                 return true;
             }
+        }
+
+        Set<Object> tagValues = resolveDynamicTag(argument);
+        if (tagValues != null) {
+            list.addAll(tagValues);
+            return true;
         }
 
         return false;

@@ -30,6 +30,13 @@ public class TabHandler implements TabCompleter {
     private static final String[] TIMES = new String[] { "w", "d", "h", "m", "s" };
     private static ArrayList<String> materials = null;
 
+    /**
+     * 使补全用的材质与标签列表失效，下次补全时重建。
+     */
+    public static void invalidateMaterials() {
+        materials = null;
+    }
+
     @Override
     public List<String> onTabComplete(CommandSender sender, Command cmd, String label, String[] args) {
         if (!(sender instanceof Player) || args.length == 0) {
@@ -435,6 +442,11 @@ public class TabHandler implements TabCompleter {
 
             // add custom tags
             for (String tag : CommandParser.getTags().keySet()) {
+                materialList.add(tag);
+            }
+
+            // add vanilla and data pack tags
+            for (String tag : CommandParser.getDynamicTagKeys()) {
                 materialList.add(tag);
             }
 
