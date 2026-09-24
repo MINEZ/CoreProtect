@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Pattern;
 
 import org.bukkit.Bukkit;
 import org.bukkit.World;
@@ -30,6 +31,7 @@ public class Config extends Language {
     private static final Map<String, String> DEFAULT_VALUES = new LinkedHashMap<>();
     private static final Map<String, Config> CONFIG_BY_WORLD_NAME = new HashMap<>();
     private static final String DEFAULT_FILE_HEADER = "# CoreProtect Config";
+    private static final Pattern NON_DIGIT_PATTERN = Pattern.compile("[^0-9]");
     public static final String LINE_SEPARATOR = "\n";
 
     private static final Config GLOBAL = new Config();
@@ -44,6 +46,7 @@ public class Config extends Language {
     public String CLICKHOUSE_PASSWORD;
     public String DUCKDB_MEMORY_LIMIT;
     public String DUCKDB_MAX_TEMP_DIRECTORY_SIZE;
+    public String SQLITE_DATABASE;
     public String PREFIX;
     public String MYSQL_HOST;
     public String MYSQL_DATABASE;
@@ -75,6 +78,7 @@ public class Config extends Language {
     public boolean NATURAL_BREAK;
     public boolean BLOCK_MOVEMENT;
     public boolean PISTONS;
+    public boolean DISPENSERS;
     public boolean BLOCK_BURN;
     public boolean BLOCK_IGNITE;
     public boolean FIRE_EXTINGUISH;
@@ -146,6 +150,7 @@ public class Config extends Language {
         DEFAULT_VALUES.put("natural-break", "true");
         DEFAULT_VALUES.put("block-movement", "true");
         DEFAULT_VALUES.put("pistons", "true");
+        DEFAULT_VALUES.put("dispensers", "true");
         DEFAULT_VALUES.put("block-burn", "true");
         DEFAULT_VALUES.put("block-ignite", "true");
         DEFAULT_VALUES.put("fire-extinguish", "false");
@@ -196,6 +201,7 @@ public class Config extends Language {
         HEADERS.put("natural-break", new String[] { "# Logs blocks that break off of other blocks; for example, a sign or torch", "# falling off of a dirt block that a player breaks. This is required for", "# beds/doors to properly rollback." });
         HEADERS.put("block-movement", new String[] { "# Properly track block movement, such as sand or gravel falling." });
         HEADERS.put("pistons", new String[] { "# Properly track blocks moved by pistons." });
+        HEADERS.put("dispensers", new String[] { "# Logs block placement and removal events caused by dispensers." });
         HEADERS.put("block-burn", new String[] { "# Logs blocks that burn up in a fire." });
         HEADERS.put("block-ignite", new String[] { "# Logs when a block naturally ignites, such as from fire spreading." });
         HEADERS.put("fire-extinguish", new String[] { "# Logs when fire naturally extinguishes." });
@@ -258,6 +264,7 @@ public class Config extends Language {
         this.DUCKDB_MEMORY_LIMIT = this.getString("duckdb-memory-limit");
         this.DUCKDB_THREADS = this.getInt("duckdb-threads", 3);
         this.DUCKDB_MAX_TEMP_DIRECTORY_SIZE = this.getString("duckdb-max-temp-directory-size");
+        this.SQLITE_DATABASE = this.getString("sqlite-database");
         this.LANGUAGE = this.getString("language");
         this.AUTO_PURGE = this.getString("auto-purge");
         this.AUTO_PURGE_TIME = this.getString("auto-purge-time");
@@ -275,6 +282,7 @@ public class Config extends Language {
         this.NATURAL_BREAK = this.getBoolean("natural-break");
         this.BLOCK_MOVEMENT = this.getBoolean("block-movement");
         this.PISTONS = this.getBoolean("pistons");
+        this.DISPENSERS = this.getBoolean("dispensers");
         this.BLOCK_BURN = this.getBoolean("block-burn");
         this.BLOCK_IGNITE = this.getBoolean("block-ignite");
         this.FIRE_EXTINGUISH = this.getBoolean("fire-extinguish");
@@ -373,7 +381,7 @@ public class Config extends Language {
             return dfl;
         }
 
-        configured = configured.replaceAll("[^0-9]", "");
+        configured = NON_DIGIT_PATTERN.matcher(configured).replaceAll("");
 
         return configured.isEmpty() ? dfl : Integer.parseInt(configured);
     }

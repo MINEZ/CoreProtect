@@ -27,11 +27,13 @@ public final class ClickHouseSchema {
             + "),toYYYYMM(toDateTime(time,'UTC')),0))";
     private static final String EVENT_SORTING_KEY = "(family,wid,x,z,if(family IN ('database_lock','user','version'),0,time),rowid,if(family='"
             + BATCH_RECEIPT_FAMILY + "',toString(batch_id),''))";
+    private static final String[] ENTITY_SPAWN_INDEX = { "entity_spawn_rowid_idx", "entity_spawn_rowid", "bloom_filter(0.01)", "1" };
     private static final String[][] EVENT_DATA_SKIPPING_INDEX_DEFINITIONS = {
             { "batch_sequence_idx", "batch_sequence", "minmax", "1" },
             { "rowid_idx", "rowid", "bloom_filter(0.01)", "1" },
             { "entity_uuid_idx", "uuid", "bloom_filter(0.01)", "1" },
-            { "entity_kill_rowid_idx", "kill_rowid", "bloom_filter(0.01)", "1" }
+            { "entity_kill_rowid_idx", "kill_rowid", "bloom_filter(0.01)", "1" },
+            ENTITY_SPAWN_INDEX
     };
     private static final String[][] STORAGE_METADATA_COLUMN_DEFINITIONS = {
             { "dataset_id", "UUID" + VALUE_CODEC },
@@ -283,6 +285,9 @@ public final class ClickHouseSchema {
                 statement.setString(3, expectedIndex[0]);
                 try (ResultSet resultSet = statement.executeQuery()) {
                     if (!resultSet.next()) {
+                        if (ENTITY_SPAWN_INDEX[0].equals(expectedIndex[0])) {
+                            continue;
+                        }
                         throw new SQLException("ClickHouse table is missing required data-skipping index " + expectedIndex[0] + ": " + table);
                     }
                     boolean matches = normalizeSql(expectedIndex[2]).equals(normalizeSql(resultSet.getString(1)))
@@ -314,7 +319,7 @@ public final class ClickHouseSchema {
         statements.add(view(names, ClickHouseFamily.SESSION, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action"));
         statements.add(view(names, ClickHouseFamily.SIGN, "e.rowid AS rowid,e.time AS time,e.user_id AS `user`," + location("wid") + "," + location("x") + ",e.y AS y," + location("z") + ",e.action AS action,e.color AS color,e.color_secondary AS color_secondary,e.sign_data AS data,e.waxed AS waxed,e.face AS face,e.line_1 AS line_1,e.line_2 AS line_2,e.line_3 AS line_3,e.line_4 AS line_4,e.line_5 AS line_5,e.line_6 AS line_6,e.line_7 AS line_7,e.line_8 AS line_8"));
         statements.add(view(names, ClickHouseFamily.SKULL, "e.rowid AS rowid,e.time AS time,e.name AS owner,e.text AS skin"));
-        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,e.time AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
+        statements.add(currentView(names, ClickHouseFamily.USER, "e.rowid AS rowid,toUInt32(ifNull(e.data,toInt64(e.time))) AS time,e.user_name AS `user`,ifNull(e.uuid,'') AS uuid"));
         statements.add(view(names, ClickHouseFamily.USERNAME_LOG, "e.rowid AS rowid,e.time AS time,e.uuid AS uuid,e.user_name AS `user`"));
         statements.add(currentView(names, ClickHouseFamily.VERSION, "e.rowid AS rowid,e.time AS time,e.version AS version"));
         statements.add(currentView(names, ClickHouseFamily.WORLD, "e.rowid AS rowid,e.id AS id,e.name AS world"));
@@ -322,13 +327,13 @@ public final class ClickHouseSchema {
 
     private static String view(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + events(names, family) + " AS e";
     }
 
     private static String currentView(Names names, ClickHouseFamily family, String projection) {
         return "CREATE OR REPLACE VIEW " + names.table(family.getTableName())
-                + " AS SELECT " + projection
+                + " AS SELECT " + projection + locationKeys(family)
                 + " FROM " + currentEvents(names, family) + " AS e";
     }
 
@@ -349,13 +354,15 @@ public final class ClickHouseSchema {
     }
 
     static String binary(String value, String alias) {
-        String presentValue = "ifNull(" + value + ",'')";
-        String bytes = "arrayMap(i -> reinterpretAsInt8(substring(" + presentValue + ",i,1)),range(1,length(" + presentValue + ")+1))";
-        return "if(isNull(" + value + "),CAST([], 'Array(Int8)'),arrayConcat([toInt8(0)]," + bytes + ")) AS " + alias;
+        return value + " AS " + alias;
     }
 
     private static String location(String column) {
         return "if(e." + column + "_present=1,e." + column + ",NULL) AS " + column;
+    }
+
+    private static String locationKeys(ClickHouseFamily family) {
+        return family.isWorldScoped() ? ",e.wid AS _key_wid,e.x AS _key_x,e.z AS _key_z" : "";
     }
 
     private static String events(Names names, ClickHouseFamily family) {
