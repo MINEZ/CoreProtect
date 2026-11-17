@@ -1,23 +1,57 @@
+# MINEZ：本 fork 的构建。每次推送都构建插件 jar 并上传为 Artifact，发 Release 时从这里取 jar 作为附件。
+# 第三方 action 固定到提交：标签可以被移动，而这里构建出的 jar 会部署到服务器上。
 name: Build
+
 on:
+  workflow_dispatch:
   push:
     branches:
       - master
+    paths-ignore:
+      - '.gitignore'
+      - 'CONTRIBUTING.md'
+      - 'LICENSE'
+      - 'README.md'
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'requirements.txt'
   pull_request:
     types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# 同一分支上有新的推送时，取消还在运行的旧构建。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build
-    runs-on: ubuntu-latest
+    name: CoreProtect
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: 0  # Shallow clones should be disabled for a better relevancy of analysis
+          persist-credentials: false
+
       - name: Set up JDK 25
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           java-version: '25'
           distribution: 'temurin'
           cache: 'maven'
+
       - name: Build
         run: mvn -B verify
+
+      # 插件 jar 为 target/CoreProtect-<版本>.jar；maven-shade-plugin 把依赖打进同名 jar，原始的 jar 改名为 original-*.jar，不上传。
+      - name: Upload CoreProtect
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: CoreProtect
+          path: |
+            target/CoreProtect-*.jar
+            !target/original-*.jar
+          if-no-files-found: error

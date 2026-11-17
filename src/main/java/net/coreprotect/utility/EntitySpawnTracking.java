@@ -40,12 +40,14 @@ import org.bukkit.persistence.PersistentDataType;
 import net.coreprotect.CoreProtect;
 import net.coreprotect.config.ConfigHandler;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.listener.entity.VehicleDestroyListener;
 import net.coreprotect.listener.player.InventoryChangeListener;
 import net.coreprotect.model.entity.EntityInteractionOrigin;
 import net.coreprotect.model.entity.EntitySpawnData;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.spigot.SpigotAdapter;
 import net.coreprotect.thread.Scheduler;
+import net.coreprotect.utility.entity.LivingEntityDetails;
 
 public final class EntitySpawnTracking {
 
@@ -55,7 +57,7 @@ public final class EntitySpawnTracking {
     private static final int ORIGIN_SEED_SIZE = Integer.BYTES + Double.BYTES * 3;
     private static final int KILL_LOCATION_INDEX = 8;
     private static final long PENDING_CLEAR_TTL_MILLIS = 300_000L;
-    private static final long UNLOADED_CACHE_RETENTION_MILLIS = 300_000L;
+    private static final long UNLOADED_CACHE_RETENTION_MILLIS = 3_600_000L;
     private static final long CLEANUP_INTERVAL_MILLIS = 60_000L;
     private static final int CHUNK_SCAN_BATCH_SIZE = 64;
     private static final int ENTITY_SCAN_BATCH_SIZE = 256;
@@ -704,6 +706,7 @@ public final class EntitySpawnTracking {
 
     public static void removeWithoutRemovalLog(Entity entity) {
         UUID uuid = entity.getUniqueId();
+        VehicleDestroyListener.cancelTntRemoval(entity);
         coreProtectRemovals.add(uuid);
         try {
             entity.remove();
@@ -932,22 +935,38 @@ public final class EntitySpawnTracking {
     }
 
     public static boolean retryPendingDatabaseIdentityVerification(UUID uuid) {
+        return retryPendingDatabaseIdentityVerification(uuid, null);
+    }
+
+    public static boolean retryPendingDatabaseIdentityVerification(UUID uuid, EntitySpawnData data) {
         PendingIdentityVerification verification = pendingIdentityVerifications.get(uuid);
         if (verification == null) {
             return false;
         }
         PendingIdentityVerification retry = new PendingIdentityVerification(verification.location, verificationEpoch.get());
+        EntitySpawnData retryData = data == null ? EntitySpawnData.verify(uuid, retry.epoch) : data.retryVerification(retry.epoch);
+        if (retryData == null) {
+            return false;
+        }
         if (!pendingIdentityVerifications.replace(uuid, verification, retry)) {
             return false;
         }
         try {
-            Queue.queueEntitySpawnUpdate(EntitySpawnData.verify(uuid, retry.epoch));
+            Queue.queueEntitySpawnUpdate(retryData);
         }
         catch (RuntimeException exception) {
             pendingIdentityVerifications.replace(uuid, retry, verification);
             throw exception;
         }
         return true;
+    }
+
+    public static void abandonDatabaseIdentityVerification(UUID uuid, long epoch) {
+        pendingClear.compute(uuid, (key, request) -> {
+            pendingIdentityVerifications.computeIfPresent(uuid, (id, verification) -> verification.epoch == epoch ? null : verification);
+            trackedLocations.computeIfPresent(uuid, (id, tracked) -> tracked.isPendingVerification(epoch) ? tracked.withVerifiedEpoch(-1L) : tracked);
+            return request;
+        });
     }
 
     public static void confirmDatabaseVerification(UUID uuid, long epoch) {
@@ -1017,6 +1036,7 @@ public final class EntitySpawnTracking {
         state.add(inventoryData);
 
         List<Object> equipmentData = null;
+        Object bodyEquipment = null;
         if (entity instanceof LivingEntity) {
             EntityEquipment equipment = ((LivingEntity) entity).getEquipment();
             if (equipment != null) {
@@ -1028,12 +1048,16 @@ public final class EntitySpawnTracking {
                 equipmentData.add(serializeItem(equipment.getChestplate()));
                 equipmentData.add(serializeItem(equipment.getHelmet()));
                 trimTrailingNulls(equipmentData);
+                bodyEquipment = LivingEntityDetails.serializeBody(equipment);
             }
         }
         state.add(equipmentData);
         if (isCushion(entity)) {
             Location location = entity.getLocation();
             state.add(Arrays.asList(location.getYaw(), location.getPitch()));
+        }
+        else if (bodyEquipment != null) {
+            state.add(bodyEquipment);
         }
         trimTrailingNulls(state);
         return state;
@@ -1150,6 +1174,9 @@ public final class EntitySpawnTracking {
             if (rotation.size() == 2 && rotation.get(0) instanceof Number && rotation.get(1) instanceof Number) {
                 entity.setRotation(((Number) rotation.get(0)).floatValue(), ((Number) rotation.get(1)).floatValue());
             }
+        }
+        else if (entity instanceof LivingEntity && state.size() > 5) {
+            LivingEntityDetails.restoreBody(((LivingEntity) entity).getEquipment(), state.get(5));
         }
     }
 
@@ -1682,7 +1709,10 @@ public final class EntitySpawnTracking {
         }
 
         private boolean matches(Location location) {
-            return location != null && location.getWorld() != null && worldId.equals(location.getWorld().getUID()) && chunkX == (location.getBlockX() >> 4) && chunkZ == (location.getBlockZ() >> 4) && Double.compare(x, location.getX()) == 0 && Double.compare(y, location.getY()) == 0 && Double.compare(z, location.getZ()) == 0 && Float.compare(yaw, location.getYaw()) == 0 && Float.compare(pitch, location.getPitch()) == 0;
+            return location != null && location.getWorld() != null && worldId.equals(location.getWorld().getUID())
+                    && Location.locToBlock(x) == location.getBlockX()
+                    && Location.locToBlock(y) == location.getBlockY()
+                    && Location.locToBlock(z) == location.getBlockZ();
         }
 
         private boolean isWithinRadius(World world, Integer[] radius) {

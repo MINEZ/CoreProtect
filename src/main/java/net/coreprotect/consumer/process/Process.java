@@ -1,12 +1,15 @@
 package net.coreprotect.consumer.process;
 
 import java.sql.Connection;
+import java.sql.DataTruncation;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.sql.SQLNonTransientException;
+import java.sql.SQLRecoverableException;
+import java.sql.SQLTransientConnectionException;
 import java.sql.Statement;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -26,7 +29,6 @@ import net.coreprotect.consumer.Queue;
 import net.coreprotect.database.ConsumerEntitySpawnUpdates;
 import net.coreprotect.database.ConsumerWriteBatch;
 import net.coreprotect.database.Database;
-import net.coreprotect.database.DatabaseType;
 import net.coreprotect.database.DuckDBRecovery;
 import net.coreprotect.database.logger.EntityInteractionLogger;
 import net.coreprotect.database.rollback.EntitySpawnRollbackHandler;
@@ -40,6 +42,7 @@ import net.coreprotect.model.rollback.RollbackUpdateTargets;
 import net.coreprotect.utility.ErrorReporter;
 import net.coreprotect.utility.EntitySpawnTracking;
 import net.coreprotect.utility.HopperTransactionUtils;
+import net.coreprotect.utility.StringUtils;
 
 public class Process {
 
@@ -81,10 +84,12 @@ public class Process {
 
     public static int lastLockUpdate = 0;
     private static volatile int currentConsumerSize = 0;
-    private static EntityUuidConflictReporter entityUuidConflicts = new EntityUuidConflictReporter();
-    private static final int MAX_PREPARATION_FAILURES = 3;
+    private static final int MAX_EVENT_FAILURES = 3;
+    private static final int MAX_TRANSACTION_FAILURES = 3;
+    private static final int DUCKDB_ENTITY_BATCH_SIZE = 1000;
     private static final int CLICKHOUSE_ACCESS_DENIED = 497;
-    private static final Map<Object[], Integer> preparationFailures = new IdentityHashMap<>();
+    private static final Map<Object[], Integer> eventFailures = new IdentityHashMap<>();
+    private static final Map<Object[], Integer> transactionFailures = new IdentityHashMap<>();
 
     private enum TransactionOutcome {
         COMMITTED,
@@ -98,15 +103,21 @@ public class Process {
     }
 
     protected static void resetPreparationFailures() {
-        preparationFailures.clear();
-        entityUuidConflicts = new EntityUuidConflictReporter();
+        eventFailures.clear();
+        transactionFailures.clear();
     }
 
-    protected static int consumerDelay(boolean backlog) {
-        if (backlog || !ConfigHandler.databaseType.isClickHouse()) {
+    public static int consumerDelay(boolean backlog) {
+        if (backlog) {
             return 500;
         }
-        return Math.max(500, Config.getGlobal().CLICKHOUSE_CONSUMER_DELAY);
+        if (ConfigHandler.databaseType.isClickHouse()) {
+            return Math.max(500, Config.getGlobal().CLICKHOUSE_CONSUMER_DELAY);
+        }
+        if (ConfigHandler.databaseType.isDuckDB()) {
+            return Math.max(500, Config.getGlobal().DUCKDB_CONSUMER_DELAY);
+        }
+        return 500;
     }
 
     public static boolean isRollbackPublication(int action, Object object) {
@@ -119,6 +130,14 @@ public class Process {
 
         EntitySpawnData.Operation operation = ((EntitySpawnData) object).getOperation();
         return operation == EntitySpawnData.Operation.ROLLBACK || operation == EntitySpawnData.Operation.RESTORE || operation == EntitySpawnData.Operation.KILL_ROLLBACK || operation == EntitySpawnData.Operation.KILL_RESTORE || operation == EntitySpawnData.Operation.COMPOSITE_ROLLBACK || operation == EntitySpawnData.Operation.COMPOSITE_RESTORE || operation == EntitySpawnData.Operation.CLAIM_RELEASE;
+    }
+
+    private static boolean isLockUpdateDue(boolean lastRun) {
+        if (lastRun) {
+            return true;
+        }
+        int unixTimestamp = (int) (System.currentTimeMillis() / 1000L);
+        return unixTimestamp - lastLockUpdate >= 15;
     }
 
     protected static void updateLockTable(ConsumerWriteBatch batch, int locked) {
@@ -135,8 +154,7 @@ public class Process {
         }
     }
 
-    protected static void processConsumer(int processId, boolean lastRun) {
-        entityUuidConflicts.flush();
+    public static void processConsumer(int processId, boolean lastRun) {
         List<PendingEntitySpawnLog> pendingEntitySpawnLogs = new ArrayList<>();
         Map<UUID, EntitySpawnIdentity> entitySpawnIdentities = new LinkedHashMap<>();
         Map<UUID, Location> pendingEntityIdentityConfirmations = new LinkedHashMap<>();
@@ -156,7 +174,20 @@ public class Process {
         Object[] preparingEvent = null;
         boolean consumerDataCleared = false;
         boolean preflightCommitted = false;
+        boolean batchedDuckDBEntityEvent = false;
+        int previousLockUpdate = lastLockUpdate;
+        boolean lockUpdatePending = false;
         int processedThrough = 0;
+        consumerData = Consumer.consumer.get(processId);
+        if (consumerData != null && consumerData.isEmpty() && ConfigHandler.databaseType.isDuckDB()
+                && ConfigHandler.databaseReachable && !isLockUpdateDue(lastRun)) {
+            currentConsumerSize = 0;
+            Consumer.consumer_id.put(processId, new Integer[] { 0, 0 });
+            if (!Consumer.hasPendingConsumerData()) {
+                DuckDBRecovery.markHealthy();
+            }
+            return;
+        }
         try {
             connection = Database.getConnection(false, 500);
             if (connection == null) {
@@ -169,32 +200,49 @@ public class Process {
             }
 
             Statement statement = connection.createStatement();
-            ConsumerWriteBatch batch = Database.openConsumerWriteBatch(connection);
-            writeBatch = batch;
             Database.performCheckpoint(statement, ConfigHandler.databaseType);
 
-            consumerData = Consumer.consumer.get(processId);
             users = Consumer.consumerUsers.get(processId);
             consumerObject = Consumer.consumerObjects.get(processId);
             int consumerDataSize = consumerData.size();
             currentConsumerSize = consumerDataSize;
 
-            if (!beginConsumerTransaction(writeBatch)) {
+            if (currentConsumerSize == 0) { // No data, skip processing
+                if (!ConfigHandler.databaseType.isDuckDB() || isLockUpdateDue(lastRun)) {
+                    writeBatch = Database.openConsumerWriteBatch(connection);
+                    if (!beginConsumerTransaction(writeBatch)) {
+                        statement.close();
+                        deferConsumerRetry();
+                        return;
+                    }
+                    previousLockUpdate = lastLockUpdate;
+                    updateLockTable(writeBatch, (lastRun ? 0 : 1));
+                    lockUpdatePending = lastLockUpdate != previousLockUpdate;
+                    if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
+                        statement.close();
+                        deferConsumerRetry();
+                        return;
+                    }
+                    lockUpdatePending = false;
+                }
+                statement.close();
+                Consumer.consumer_id.put(processId, new Integer[] { 0, 0 });
+                if (!Consumer.hasPendingConsumerData()) {
+                    DuckDBRecovery.markHealthy();
+                }
+                return;
+            }
+
+            ConsumerWriteBatch batch = Database.openConsumerWriteBatch(connection);
+            writeBatch = batch;
+
+            boolean coalesceDuckDBPreflight = ConfigHandler.databaseType.isDuckDB();
+            if (!coalesceDuckDBPreflight && !beginConsumerTransaction(writeBatch)) {
                 deferConsumerRetry();
                 return;
             }
 
-            if (currentConsumerSize == 0) { // No data, skip processing
-                updateLockTable(writeBatch, (lastRun ? 0 : 1));
-                if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
-                    deferConsumerRetry();
-                    return;
-                }
-                statement.close();
-                Consumer.consumer_id.put(processId, new Integer[] { 0, 0 });
-                return;
-            }
-
+            boolean hasUserPreflight = false;
             boolean hasEntitySpawnUpdates = false;
             boolean hasEntitySpawnLogs = false;
             boolean hasEntityContainerTransactions = false;
@@ -209,7 +257,12 @@ public class Process {
                     continue;
                 }
                 preparingEvent = data;
-                preflightUser(writeBatch, data, users);
+                if (coalesceDuckDBPreflight) {
+                    hasUserPreflight |= needsUserPreflight(data, users);
+                }
+                else {
+                    preflightUser(writeBatch, data, users);
+                }
                 int action = (int) data[1];
                 hasEntitySpawnUpdates |= action == Process.ENTITY_SPAWN_UPDATE || action == Process.ENTITY_CONTAINER_TRANSITION_UPDATE;
                 hasEntitySpawnLogs |= action == Process.ENTITY_SPAWN_LOG;
@@ -253,17 +306,37 @@ public class Process {
                     }
                 }
             }
-
             preparingEvent = null;
-            updateLockTable(writeBatch, (lastRun ? 0 : 1));
-            if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
-                invalidateUserCaches(users);
-                failConsumerBatch(processId, consumerData, users, consumerObject, 0, 0);
-                return;
+
+            if (!coalesceDuckDBPreflight || hasUserPreflight) {
+                if (coalesceDuckDBPreflight) {
+                    if (!beginConsumerTransaction(writeBatch)) {
+                        deferConsumerRetry();
+                        return;
+                    }
+                    for (int index = 0; index < consumerDataSize; index++) {
+                        Object[] data = consumerData.get(index);
+                        if (data == null) {
+                            continue;
+                        }
+                        preparingEvent = data;
+                        preflightUser(writeBatch, data, users);
+                    }
+                    preparingEvent = null;
+                }
+                previousLockUpdate = lastLockUpdate;
+                updateLockTable(writeBatch, (lastRun ? 0 : 1));
+                lockUpdatePending = lastLockUpdate != previousLockUpdate;
+                if (commit(writeBatch) != TransactionOutcome.COMMITTED) {
+                    invalidateUserCaches(users);
+                    failConsumerBatch(processId, consumerData, users, consumerObject, 0, 0);
+                    return;
+                }
+                lockUpdatePending = false;
             }
             preflightCommitted = true;
 
-            if (hasEntityContainerTransactions || hasEntityInteractions || hasEntitySpawnLogs) {
+            if (hasEntityContainerTransactions || hasEntityInteractions || hasEntitySpawnLogs || !entityIdentityUuids.isEmpty() || !entityIdentityRowIds.isEmpty()) {
                 entitySpawnIdentities.putAll(EntitySpawnStatement.loadIdentities(connection, entityIdentityUuids));
                 Map<Integer, EntitySpawnIdentity> identitiesByRowId = EntitySpawnStatement.loadIdentitiesByRowIds(connection, entityIdentityRowIds);
                 bindPendingEntitySpawnIdentities(consumerData, consumerObject, entitySpawnIdentities, identitiesByRowId);
@@ -273,6 +346,11 @@ public class Process {
             if (!beginConsumerTransaction(writeBatch)) {
                 deferConsumerRetry();
                 return;
+            }
+            if (coalesceDuckDBPreflight && !hasUserPreflight) {
+                previousLockUpdate = lastLockUpdate;
+                updateLockTable(writeBatch, (lastRun ? 0 : 1));
+                lockUpdatePending = lastLockUpdate != previousLockUpdate;
             }
             entitySpawnUpdates = hasEntitySpawnUpdates ? writeBatch.entitySpawnUpdates() : null;
             if (entitySpawnUpdates != null) {
@@ -290,14 +368,15 @@ public class Process {
                     Material replaceType = (Material) data[4];
                     int replaceData = (int) data[5];
                     int forceData = (int) data[6];
-                    boolean isolatedTransaction = requiresIsolatedDuckDBTransaction(action);
-                    Exception duplicateEntityUuidFailure = null;
+                    boolean isolatedTransaction = requiresIsolatedDuckDBTransaction(action, action == ENTITY_SPAWN_UPDATE ? consumerObject.get(id) : null, entitySpawnIdentities);
                     preparingEvent = null;
 
                     if (isolatedTransaction && i > processedThrough) {
-                        TransactionOutcome outcome = commit(writeBatch);
+                        TransactionOutcome outcome = commit(writeBatch, consumerData, processedThrough, i);
                         if (outcome == TransactionOutcome.COMMITTED) {
+                            lockUpdatePending = false;
                             processedThrough = i;
+                            batchedDuckDBEntityEvent = false;
                         }
                         completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                         if (outcome != TransactionOutcome.COMMITTED) {
@@ -365,12 +444,7 @@ public class Process {
                                     EntitySpawnIdentity[] loggedIdentity = { existingIdentity };
                                     boolean[] identityActive = new boolean[1];
                                     try {
-                                        logEntityInteraction(connection, writeBatch, interaction, logContext, loggedIdentity, identityActive);
-                                    }
-                                    catch (UnresolvedEntityInteractionException e) {
-                                        Database.acknowledgeRollbackOnlyTransaction();
-                                        duplicateEntityUuidFailure = e;
-                                        break;
+                                        logEntityInteraction(writeBatch, interaction, logContext, loggedIdentity, identityActive);
                                     }
                                     catch (Exception e) {
                                         pendingEntityInteractions.add(new PendingEntityInteraction(user, interaction, false, true));
@@ -517,18 +591,7 @@ public class Process {
                                                 entitySpawnIdentities.putIfAbsent(update.getUuid(), previousIdentity);
                                             }
                                         }
-                                        EntitySpawnIdentity createdIdentity;
-                                        try {
-                                            createdIdentity = applyEntitySpawnUpdate(connection, writeBatch, entitySpawnUpdates, update);
-                                        }
-                                        catch (UnresolvedEntityRemovalException e) {
-                                            // The event owns this isolated transaction. Only retire it
-                                            // after the acknowledged rollback below succeeds.
-                                            Database.acknowledgeRollbackOnlyTransaction();
-                                            entitySpawnUpdates.afterRetain();
-                                            duplicateEntityUuidFailure = e;
-                                            break;
-                                        }
+                                        EntitySpawnIdentity createdIdentity = entitySpawnUpdates.apply(update);
                                         if (createdIdentity != null) {
                                             entitySpawnIdentities.put(createdIdentity.getUuid(), createdIdentity);
                                             promotedEntityIdentities.add(createdIdentity.getUuid());
@@ -536,16 +599,22 @@ public class Process {
                                     }
                                     break;
                             }
+                            if (ConfigHandler.databaseType.isDuckDB() && !isolatedTransaction && isDuckDBEntityBatchAction(action)) {
+                                batchedDuckDBEntityEvent = true;
+                            }
 
                             preparingEvent = null;
                             // Commit full or interrupted batches before continuing.
                             boolean interrupted = Consumer.interrupt;
-                            boolean batchLimitReached = writeBatch.shouldCommit();
+                            boolean batchLimitReached = writeBatch.shouldCommit()
+                                    || (batchedDuckDBEntityEvent && i + 1 - processedThrough >= DUCKDB_ENTITY_BATCH_SIZE);
                             if ((interrupted || batchLimitReached) && !isolatedTransaction) {
                                 int batchStart = processedThrough;
-                                TransactionOutcome outcome = commit(writeBatch);
+                                TransactionOutcome outcome = commit(writeBatch, consumerData, processedThrough, i + 1);
                                 if (outcome == TransactionOutcome.COMMITTED) {
+                                    lockUpdatePending = false;
                                     processedThrough = i + 1;
+                                    batchedDuckDBEntityEvent = false;
                                 }
                                 completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                                 if (outcome != TransactionOutcome.COMMITTED) {
@@ -600,29 +669,15 @@ public class Process {
 
                     preparingEvent = null;
                     if (isolatedTransaction) {
-                        TransactionOutcome outcome = commit(writeBatch);
+                        TransactionOutcome outcome = commit(writeBatch, consumerData, processedThrough, i + 1);
                         if (outcome == TransactionOutcome.COMMITTED) {
+                            lockUpdatePending = false;
                             processedThrough = i + 1;
+                            batchedDuckDBEntityEvent = false;
                         }
                         completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
                         if (outcome != TransactionOutcome.COMMITTED) {
                             completeFailedConsumerBatch(processId, consumerData, users, consumerObject, processedThrough, i + 1, outcome == TransactionOutcome.RETAINED);
-                            return;
-                        }
-                        if (duplicateEntityUuidFailure != null) {
-                            if (action == ENTITY_SPAWN_UPDATE) {
-                                EntitySpawnData removal = (EntitySpawnData) consumerObject.get(id);
-                                EntitySpawnTracking.clearTracking(removal.getUuid());
-                                entityUuidConflicts.record(true, removal.getUuid());
-                                ErrorReporter.report(new IllegalStateException("Dropped entity removal after a duplicate DuckDB entity UUID remained unresolved in a fresh transaction; terminal removal was not recorded: " + removal.getUuid(), duplicateEntityUuidFailure), false);
-                            }
-                            else {
-                                EntityInteraction interaction = (EntityInteraction) consumerObject.get(id);
-                                cancelEntityInteractionPromotion(interaction);
-                                entityUuidConflicts.record(false, interaction.getEntityUuid());
-                                ErrorReporter.report(new IllegalStateException("Dropped entity interaction after a duplicate DuckDB entity UUID prevented identity creation: " + interaction.getEntityUuid(), duplicateEntityUuidFailure), false);
-                            }
-                            retryConsumerBatch(processId, consumerData, users, consumerObject, processedThrough);
                             return;
                         }
                         if (!beginConsumerTransaction(writeBatch)) {
@@ -635,8 +690,9 @@ public class Process {
             }
 
             // commit data to database
-            TransactionOutcome outcome = commit(writeBatch);
+            TransactionOutcome outcome = commit(writeBatch, consumerData, processedThrough, consumerData.size());
             if (outcome == TransactionOutcome.COMMITTED) {
+                lockUpdatePending = false;
                 processedThrough = consumerData.size();
             }
             completeTransactionState(entitySpawnUpdates, pendingEntityContainerTransactions, pendingEntityContainerRollbacks, pendingEntityInteractions, pendingEntityIdentityConfirmations, invalidatedEntityIdentityConfirmations, promotedEntityIdentities, entitySpawnIdentities, pendingEntitySpawnLogs, outcome);
@@ -668,11 +724,13 @@ public class Process {
                 }
             }
             if (!recoveryRequested) {
-                if (preparingEvent != null && isPermanentPreparationFailure(e)
-                        && preparationFailures.merge(preparingEvent, 1, Integer::sum) >= MAX_PREPARATION_FAILURES) {
+                if (!DuckDBRecovery.isPending() && !Consumer.isPersistenceHalted()
+                        && preparingEvent != null && shouldLimitEventRetries(e)
+                        && eventFailures.merge(preparingEvent, 1, Integer::sum) >= MAX_EVENT_FAILURES) {
                     try {
                         discardFailedConsumerData(processId, consumerData, users, consumerObject, preparingEvent, e);
                         consumerDataCleared = consumerData.isEmpty();
+                        ErrorReporter.report(new IllegalStateException("Dropped consumer record after " + MAX_EVENT_FAILURES + " failed attempts", e));
                     }
                     catch (Exception cleanupException) {
                         e.addSuppressed(cleanupException);
@@ -682,6 +740,9 @@ public class Process {
             }
         }
         finally {
+            if (lockUpdatePending) {
+                lastLockUpdate = previousLockUpdate;
+            }
             if (writeBatch != null) {
                 try {
                     writeBatch.close();
@@ -709,27 +770,13 @@ public class Process {
         if (consumerDataCleared) {
             currentConsumerSize = 0;
             Consumer.consumer_id.put(processId, new Integer[] { 0, 0 });
+            if (!Consumer.hasPendingConsumerData()) {
+                DuckDBRecovery.markHealthy();
+            }
         }
         else if (!Consumer.isPersistenceHalted()) {
             deferConsumerRetry();
         }
-    }
-
-    protected static boolean requiresEntityUuidMaintenance(int processId) {
-        if (!ConfigHandler.databaseType.isDuckDB()) {
-            return false;
-        }
-        for (Object object : Consumer.consumerObjects.get(processId).values()) {
-            EntitySpawnData update = getEntitySpawnUpdate(object);
-            if (update == null) {
-                continue;
-            }
-            EntitySpawnData.Operation operation = update.getOperation();
-            if (operation == EntitySpawnData.Operation.REVIVED || operation == EntitySpawnData.Operation.RESTORE || operation == EntitySpawnData.Operation.KILL_ROLLBACK) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static void bindPendingEntitySpawnIdentities(ArrayList<Object[]> consumerData, Map<Integer, Object> consumerObjects, Map<UUID, EntitySpawnIdentity> identities, Map<Integer, EntitySpawnIdentity> identitiesByRowId) {
@@ -911,17 +958,23 @@ public class Process {
         }
     }
 
-    static void preflightUser(ConsumerWriteBatch batch, Object[] data,
-            Map<Integer, String[]> users) throws Exception {
+    private static boolean needsUserPreflight(Object[] data,
+            Map<Integer, String[]> users) {
         String[] userData = users.get((int) data[0]);
         if (userData == null) {
-            return;
+            return false;
         }
-        String user = userData[0];
+        String user = StringUtils.normalizeUsername(userData[0]);
         String uuid = userData[1];
-        if (user != null && ((ConfigHandler.databaseType.isClickHouse() && uuid != null && !uuid.isEmpty())
-                || ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT)) == null)) {
-            batch.resolveUserId(user, uuid);
+        return user != null && ((ConfigHandler.databaseType.isClickHouse() && uuid != null && !uuid.isEmpty())
+                || ConfigHandler.playerIdCache.get(user.toLowerCase(Locale.ROOT)) == null);
+    }
+
+    static void preflightUser(ConsumerWriteBatch batch, Object[] data,
+            Map<Integer, String[]> users) throws Exception {
+        if (needsUserPreflight(data, users)) {
+            String[] userData = users.get((int) data[0]);
+            batch.resolveUserId(StringUtils.normalizeUsername(userData[0]), userData[1]);
         }
     }
 
@@ -965,7 +1018,7 @@ public class Process {
             if (data == null || data.length == 0 || data[0] == null) {
                 continue;
             }
-            String user = data[0].toLowerCase(Locale.ROOT);
+            String user = StringUtils.normalizeUsername(data[0]).toLowerCase(Locale.ROOT);
             Integer userId = ConfigHandler.playerIdCache.remove(user);
             if (userId != null) {
                 ConfigHandler.playerIdCacheReversed.remove(userId);
@@ -989,7 +1042,8 @@ public class Process {
             if (data == null) {
                 continue;
             }
-            preparationFailures.remove(data);
+            eventFailures.remove(data);
+            transactionFailures.remove(data);
             Integer id = (Integer) data[0];
             discardConsumerData(processId, users, consumerObject, id, (int) data[1]);
             consumerData.set(index, null);
@@ -1003,7 +1057,8 @@ public class Process {
             return;
         }
         consumerData.remove(failedIndex);
-        preparationFailures.remove(failedEvent);
+        eventFailures.remove(failedEvent);
+        transactionFailures.remove(failedEvent);
         Set<Integer> failedIds;
         if (failedEvent.length > 0 && failedEvent[0] instanceof Integer) {
             failedIds = Set.of((Integer) failedEvent[0]);
@@ -1025,7 +1080,8 @@ public class Process {
                 if (object instanceof Location && userData != null && userData.length > 0 && userData[0] != null
                         && failedEvent.length > 6 && failedEvent[6] instanceof Integer) {
                     if (action == CONTAINER_TRANSACTION) {
-                        ContainerTransactionProcess.discard(processId, failedIndex, (int) failedEvent[6], userData[0], (Location) object);
+                        Material type = failedEvent[2] instanceof Material ? (Material) failedEvent[2] : null;
+                        ContainerTransactionProcess.discard(processId, failedIndex, type, (int) failedEvent[6], userData[0], (Location) object);
                     }
                     else if (action == ITEM_TRANSACTION) {
                         ItemTransactionProcess.discard((int) failedEvent[6], userData[0], (Location) object);
@@ -1042,6 +1098,9 @@ public class Process {
                     }
                     if (spawnData.getOperation() == null) {
                         EntitySpawnTracking.reverifyDatabaseRow(spawnData.getUuid(), spawnData.getLocation());
+                    }
+                    else if (spawnData.getOperation() == EntitySpawnData.Operation.VERIFY) {
+                        EntitySpawnTracking.abandonDatabaseIdentityVerification(spawnData.getUuid(), spawnData.getVerificationEpoch());
                     }
                 }
             }
@@ -1069,7 +1128,8 @@ public class Process {
         if (action == CONTAINER_TRANSACTION && location.getWorld() == null) {
             return null;
         }
-        String candidate = action == CONTAINER_TRANSACTION ? HopperTransactionUtils.getLoggingId(userData[0], location)
+        Material type = data[2] instanceof Material ? (Material) data[2] : null;
+        String candidate = action == CONTAINER_TRANSACTION ? HopperTransactionUtils.getLoggingId(userData[0], type, location)
                 : ItemTransactionProcess.getLoggingId(userData[0], location);
         return loggingId.equals(candidate) ? (Integer) data[6] : null;
     }
@@ -1110,135 +1170,85 @@ public class Process {
         Consumer.consumerObjectList.get(processId).remove(id);
     }
 
+    private static boolean shouldLimitEventRetries(Throwable failure) {
+        if (!ConfigHandler.databaseType.isDuckDB()) {
+            return isPermanentPreparationFailure(failure);
+        }
+        Set<Throwable> visited = new HashSet<>();
+        ArrayDeque<Throwable> pending = new ArrayDeque<>();
+        if (failure != null) {
+            pending.add(failure);
+        }
+        while (!pending.isEmpty()) {
+            failure = pending.removeLast();
+            if (!visited.add(failure)) {
+                continue;
+            }
+            if (failure instanceof SQLNonTransientConnectionException || failure instanceof SQLTransientConnectionException
+                    || failure instanceof SQLRecoverableException || failure instanceof InterruptedException) {
+                return false;
+            }
+            if (failure instanceof SQLException) {
+                String state = ((SQLException) failure).getSQLState();
+                if (state != null && state.startsWith("08")) {
+                    return false;
+                }
+                SQLException next = ((SQLException) failure).getNextException();
+                if (next != null) {
+                    pending.add(next);
+                }
+            }
+            if (failure.getCause() != null) {
+                pending.add(failure.getCause());
+            }
+        }
+        return true;
+    }
+
     private static boolean isPermanentPreparationFailure(Throwable failure) {
         Set<Throwable> visited = new HashSet<>();
+        ArrayDeque<Throwable> pending = new ArrayDeque<>();
+        if (failure != null) {
+            pending.add(failure);
+        }
         boolean sqlFailure = false;
-        while (failure != null && visited.add(failure)) {
+        while (!pending.isEmpty()) {
+            failure = pending.removeLast();
+            if (!visited.add(failure)) {
+                continue;
+            }
             if (failure instanceof IllegalArgumentException || failure instanceof ClassCastException
                     || failure instanceof NullPointerException || failure instanceof IndexOutOfBoundsException
                     || failure instanceof ArithmeticException
+                    || failure instanceof DataTruncation
                     || (failure instanceof SQLNonTransientException && !(failure instanceof SQLNonTransientConnectionException))
                     || (ConfigHandler.databaseType.isClickHouse() && failure instanceof SQLException
                             && ((SQLException) failure).getErrorCode() == CLICKHOUSE_ACCESS_DENIED)) {
                 return true;
             }
-            sqlFailure |= failure instanceof SQLException;
-            failure = failure.getCause();
+            if (failure instanceof SQLException) {
+                sqlFailure = true;
+                SQLException next = ((SQLException) failure).getNextException();
+                if (next != null) {
+                    pending.add(next);
+                }
+            }
+            if (failure.getCause() != null) {
+                pending.add(failure.getCause());
+            }
         }
         return !sqlFailure;
     }
 
-    private static void logEntityInteraction(Connection connection, ConsumerWriteBatch batch,
+    private static void logEntityInteraction(ConsumerWriteBatch batch,
             EntityInteraction interaction, EntityInteractionLogger.LogContext context,
             EntitySpawnIdentity[] identity, boolean[] active) throws Exception {
-        Database.SavepointOperation operation = () -> {
+        batch.executeAtomically("entity_interaction_log", () -> {
             if (identity[0] == null) {
                 identity[0] = EntitySpawnStatement.insertIdentity(batch, interaction.getTime(), interaction.getEntityUuid(), interaction.getOrigin(), interaction.getCurrentLocation());
             }
             active[0] = EntityInteractionLogger.log(batch, identity[0], interaction, context);
-        };
-        try {
-            batch.executeAtomically("entity_interaction_log", operation);
-            return;
-        }
-        catch (Exception failure) {
-            if (identity[0] != null || !isDuplicateEntityUuidFailure(interaction.getEntityUuid(), failure)) {
-                throw failure;
-            }
-            // This interaction owns an isolated DuckDB transaction. Refresh the
-            // snapshot only after confirming rollback of the failed insert.
-            Database.acknowledgeRollbackOnlyTransaction();
-            if (!batch.commit()) {
-                throw new SQLException("Unable to roll back conflicting entity interaction", failure);
-            }
-            batch.begin();
-        }
-
-        identity[0] = EntitySpawnStatement.loadIdentities(connection, Collections.singleton(interaction.getEntityUuid())).get(interaction.getEntityUuid());
-        try {
-            batch.executeAtomically("entity_interaction_retry", operation);
-        }
-        catch (Exception failure) {
-            if (identity[0] != null || !isDuplicateEntityUuidFailure(interaction.getEntityUuid(), failure)) {
-                throw failure;
-            }
-            throw new UnresolvedEntityInteractionException(failure);
-        }
-    }
-
-    private static final class UnresolvedEntityInteractionException extends SQLException {
-        private static final long serialVersionUID = 1L;
-
-        private UnresolvedEntityInteractionException(Exception cause) {
-            super("Entity interaction UUID remains unresolved after transaction refresh", cause);
-        }
-    }
-
-    private static EntitySpawnIdentity applyEntitySpawnUpdate(Connection connection, ConsumerWriteBatch batch,
-            ConsumerEntitySpawnUpdates updates, EntitySpawnData data) throws Exception {
-        if (!ConfigHandler.databaseType.isDuckDB() || data.getOperation() != EntitySpawnData.Operation.REMOVED) {
-            return updates.apply(data);
-        }
-
-        EntitySpawnIdentity[] identity = new EntitySpawnIdentity[1];
-        try {
-            batch.executeAtomically("entity_removal", () -> identity[0] = updates.apply(data));
-            return identity[0];
-        }
-        catch (Exception failure) {
-            if (!isDuplicateEntityRemovalFailure(data, failure)) {
-                throw failure;
-            }
-            // DuckDB constraint failures abort the transaction. A lookup here
-            // cannot reconcile a row committed after the old snapshot began.
-            Database.acknowledgeRollbackOnlyTransaction();
-            if (!batch.commit()) {
-                throw new SQLException("Unable to roll back conflicting entity removal", failure);
-            }
-            updates.afterRetain();
-            batch.begin();
-        }
-
-        try {
-            batch.executeAtomically("entity_removal_retry", () -> identity[0] = updates.apply(data));
-        }
-        catch (Exception failure) {
-            if (!isDuplicateEntityRemovalFailure(data, failure)) {
-                throw failure;
-            }
-            throw new UnresolvedEntityRemovalException(failure);
-        }
-        // Reuse the reconciled identity for later events in this consumer batch.
-        return identity[0] != null ? identity[0]
-                : EntitySpawnStatement.loadIdentities(connection, Collections.singleton(data.getUuid())).get(data.getUuid());
-    }
-
-    private static final class UnresolvedEntityRemovalException extends SQLException {
-        private static final long serialVersionUID = 1L;
-
-        private UnresolvedEntityRemovalException(Exception cause) {
-            super("Entity removal UUID remains unresolved after transaction refresh", cause);
-        }
-    }
-
-    private static boolean isDuplicateEntityRemovalFailure(EntitySpawnData data, Throwable failure) {
-        return data.getOperation() == EntitySpawnData.Operation.REMOVED && isDuplicateEntityUuidFailure(data.getUuid(), failure);
-    }
-
-    private static boolean isDuplicateEntityUuidFailure(UUID uuid, Throwable failure) {
-        if (!ConfigHandler.databaseType.isDuckDB()) {
-            return false;
-        }
-        Set<Throwable> visited = new HashSet<>();
-        while (failure != null && visited.add(failure)) {
-            String message = failure.getMessage();
-            if (failure instanceof SQLException && message != null
-                    && message.contains("Constraint Error: Duplicate key \"uuid: " + uuid + "\" violates unique constraint")) {
-                return true;
-            }
-            failure = failure.getCause();
-        }
-        return false;
+        });
     }
 
     private static void clearConsumerData(int processId, ArrayList<Object[]> consumerData, Map<Integer, String[]> users, Map<Integer, Object> consumerObject) {
@@ -1314,11 +1324,26 @@ public class Process {
         }
     }
 
-    private static boolean requiresIsolatedDuckDBTransaction(int action) {
+    private static boolean isDuckDBEntityBatchAction(int action) {
+        return action == ENTITY_CONTAINER_TRANSACTION || action == ENTITY_INTERACTION || action == ENTITY_CONTAINER_ROLLBACK_UPDATE || action == ENTITY_SPAWN_LOG || action == ENTITY_SPAWN_UPDATE;
+    }
+
+    private static boolean requiresIsolatedDuckDBTransaction(int action, Object object, Map<UUID, EntitySpawnIdentity> identities) {
         if (!ConfigHandler.databaseType.isDuckDB()) {
             return false;
         }
-        return action == ENTITY_CONTAINER_TRANSACTION || action == ENTITY_INTERACTION || action == ENTITY_CONTAINER_ROLLBACK_UPDATE || action == ENTITY_CONTAINER_TRANSITION_UPDATE || action == ENTITY_SPAWN_LOG || action == ENTITY_SPAWN_UPDATE;
+        if (action == ENTITY_CONTAINER_TRANSITION_UPDATE) {
+            return true;
+        }
+        if (action == ENTITY_SPAWN_UPDATE && object instanceof EntitySpawnData) {
+            EntitySpawnData update = (EntitySpawnData) object;
+            if (isRollbackPublication(action, update) || update.getOperation() == EntitySpawnData.Operation.REVIVED) {
+                return true;
+            }
+            EntitySpawnIdentity identity = identities.get(update.getUuid());
+            return update.getOperation() == EntitySpawnData.Operation.REMOVED && identity != null && !identity.getUuid().equals(update.getUuid());
+        }
+        return false;
     }
 
     private static TransactionOutcome failedCommitOutcome(ConsumerWriteBatch batch) {
@@ -1363,7 +1388,6 @@ public class Process {
         try {
             boolean committed = batch.commit();
             if (committed) {
-                DuckDBRecovery.markHealthy();
                 return TransactionOutcome.COMMITTED;
             }
             return failedCommitOutcome(batch);
@@ -1373,6 +1397,26 @@ public class Process {
             batch.rollback();
             return failedCommitOutcome(batch);
         }
+    }
+
+    private static TransactionOutcome commit(ConsumerWriteBatch batch, List<Object[]> data, int fromIndex, int toIndex) {
+        TransactionOutcome outcome = commit(batch);
+        if (outcome == TransactionOutcome.RETAINED && ConfigHandler.databaseType.isDuckDB() && !DuckDBRecovery.isPending()
+                && !Consumer.isPersistenceHalted()
+                && shouldLimitEventRetries(batch.getCommitFailure())) {
+            for (int index = fromIndex; index < toIndex; index++) {
+                Object[] event = data.get(index);
+                if (event != null) {
+                    if (transactionFailures.merge(event, 1, Integer::sum) >= MAX_TRANSACTION_FAILURES) {
+                        ErrorReporter.report(new IllegalStateException("Dropped " + (toIndex - fromIndex)
+                                + " consumer record(s) after " + MAX_TRANSACTION_FAILURES + " failed transaction attempts", batch.getCommitFailure()));
+                        return TransactionOutcome.DISCARDED;
+                    }
+                    break;
+                }
+            }
+        }
+        return outcome;
     }
 
     private static final class PendingEntityContainerTransaction {

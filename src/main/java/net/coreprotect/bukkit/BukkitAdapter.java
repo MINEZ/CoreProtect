@@ -40,6 +40,7 @@ import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.SignChangeEvent;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.inventory.EntityEquipment;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.MerchantRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -76,6 +77,7 @@ public class BukkitAdapter implements BukkitInterface {
     public static final int BUKKIT_V26_0 = 26000;
     public static final int BUKKIT_V26_1 = 26010;
     public static final int BUKKIT_V26_2 = 26020;
+    public static final int BUKKIT_V26_3 = 26030;
 
     public static int getAdapterVersion(int major, int minor) {
         return getAdapterVersion(major, minor, 0);
@@ -95,7 +97,10 @@ public class BukkitAdapter implements BukkitInterface {
      */
     public static void loadAdapter() {
         int bukkitVersion = ConfigHandler.SERVER_VERSION;
-        if (bukkitVersion >= BUKKIT_V26_2) {
+        if (bukkitVersion >= BUKKIT_V26_3) {
+            ADAPTER = new Bukkit_v26_3();
+        }
+        else if (bukkitVersion >= BUKKIT_V26_2) {
             ADAPTER = new Bukkit_v26_2();
         }
         else if (bukkitVersion >= BUKKIT_V1_21_11) {
@@ -147,6 +152,20 @@ public class BukkitAdapter implements BukkitInterface {
     @Override
     public boolean getEntityMeta(LivingEntity entity, List<Object> info) {
         return false;
+    }
+
+    @Override
+    public boolean hasBodyItemSlot() {
+        return false;
+    }
+
+    @Override
+    public ItemStack getBodyItem(EntityEquipment equipment) {
+        return null;
+    }
+
+    @Override
+    public void setBodyItem(EntityEquipment equipment, ItemStack item) {
     }
 
     @Override

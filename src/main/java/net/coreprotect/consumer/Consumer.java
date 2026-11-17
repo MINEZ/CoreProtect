@@ -505,7 +505,7 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
         }
     }
 
-    private static boolean isShutdownDrainStopped() {
+    public static boolean isShutdownDrainStopped() {
         return databaseReloadBlockedForShutdown && !ConfigHandler.shutdownDrainRunning;
     }
 
@@ -541,20 +541,7 @@ public class Consumer extends Process implements Runnable, Thread.UncaughtExcept
             return;
         }
         try {
-            boolean exclusive = requiresEntityUuidMaintenance(processId);
-            if (exclusive) {
-                databaseLock.unlock();
-                databaseLock = null;
-                Lock writeLock = databaseLifecycle.writeLock();
-                if (!lockConsumerDatabase(writeLock)) {
-                    return;
-                }
-                databaseLock = writeLock;
-            }
             if (databaseReloadPaused || isPaused || persistenceHalted || isShutdownDrainStopped()) {
-                return;
-            }
-            if (exclusive && !Database.awaitConnectionDrain(0L)) {
                 return;
             }
             Process.processConsumer(processId, lastRun);
