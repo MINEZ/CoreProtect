@@ -10,8 +10,8 @@
 <br>
 
 <div>
-<a href="https://github.com/PlayPro/CoreProtect"><img src="https://img.shields.io/badge/upstream-25.0-2196f3" alt="upstream"></a>
-<a href="#版本号"><img src="https://img.shields.io/badge/version-25.0.3-4caf50" alt="version"></a>
+<a href="https://github.com/PlayPro/CoreProtect"><img src="https://img.shields.io/badge/upstream-26.2-2196f3" alt="upstream"></a>
+<a href="#版本号"><img src="https://img.shields.io/badge/version-26.2.1-4caf50" alt="version"></a>
 <a href="#受支持的版本"><img src="https://img.shields.io/badge/Paper-26.3-4caf50" alt="Paper"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Artistic%202.0-9e9e9e" alt="license"></a>
 </div>
@@ -85,9 +85,9 @@ mvn -B verify
 
 ## 版本号
 
-本 Fork 的版本号为上游版本号加一位修订号：`25.0.3` 即基于上游 `25.0` 的第 3 个构建。上游的版本号变化后，修订号从 `.1` 重新开始。
+本 Fork 的版本号为上游版本号加一位修订号：`26.2.1` 即基于上游 `26.2` 的第 1 个构建。上游的版本号变化后，修订号从 `.1` 重新开始。
 
-上游会先把部分构建发布给 Patreon 赞助者，之后公开仓库才跟上，所以 Patreon 上的版本号可能领先于公开源码中的版本号。本 Fork 只跟随公开仓库，版本号始终标明所基于的公开版本。
+上游把最新的构建发布给 Patreon 赞助者，公开源码中写的版本号（`pom.xml`）则滞后。代码是一样的：公开的 `master` 分支已经包含这些构建的全部内容，版本号也不会解锁其中任何功能。本 Fork 的上游版本号取 Patreon 上最新发布的版本，而不是 `pom.xml` 中的，使版本号与代码的实际内容相符。
 
 本 Fork 以 `pom.xml` 中的 `development` 分支设置构建，这是编译上游最新代码所必需的。这样构建出来的 CoreProtect 会跳过数据库补丁脚本，启动时显示“Development branch detected, skipping patch scripts.”。这条提示属正常现象，但也意味着上游以补丁脚本发布的数据库迁移在这里不会执行；写在代码中的修复照常生效。
 

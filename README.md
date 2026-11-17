@@ -10,8 +10,8 @@ A fork of [CoreProtect](https://github.com/PlayPro/CoreProtect) maintained for t
 <br>
 
 <div>
-<a href="https://github.com/PlayPro/CoreProtect"><img src="https://img.shields.io/badge/upstream-25.0-2196f3" alt="upstream"></a>
-<a href="#versioning"><img src="https://img.shields.io/badge/version-25.0.3-4caf50" alt="version"></a>
+<a href="https://github.com/PlayPro/CoreProtect"><img src="https://img.shields.io/badge/upstream-26.2-2196f3" alt="upstream"></a>
+<a href="#versioning"><img src="https://img.shields.io/badge/version-26.2.1-4caf50" alt="version"></a>
 <a href="#supported-versions"><img src="https://img.shields.io/badge/Paper-26.3-4caf50" alt="Paper"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-Artistic%202.0-9e9e9e" alt="license"></a>
 </div>
@@ -85,9 +85,9 @@ Every push to `master` is also built by [GitHub Actions](https://github.com/MINE
 
 ## Versioning
 
-The fork version is the upstream version with a revision number added: `25.0.3` is the third build of this fork based on upstream `25.0`. The number restarts at `.1` when upstream's version changes.
+The fork version is the upstream version with a revision number added: `26.2.1` is the first build of this fork based on upstream `26.2`. The number restarts at `.1` when upstream's version changes.
 
-Upstream publishes some builds to its Patreon supporters before the public repository catches up, and the version on Patreon can be ahead of the one in the public source. This fork only follows the public repository, and its version always names the public version it is built from.
+Upstream releases its newest builds to Patreon supporters, while the version written in the public source (`pom.xml`) lags behind. The code is the same: the public `master` branch already carries everything in those builds, and the version number unlocks nothing in it. This fork takes its upstream version from the newest release on Patreon rather than from `pom.xml`, so its version reflects what the code actually is.
 
 The fork is built from the `development` branch setting in `pom.xml`, which is needed to build upstream's latest code. On such builds CoreProtect skips its database patch scripts and prints “Development branch detected, skipping patch scripts.” at startup. That message is expected, but it means database migrations that upstream ships as patch scripts do not run here; fixes made in code take effect as usual.
 
